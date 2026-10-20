@@ -1,0 +1,270 @@
+name: Refine report navigation and language
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/refine-report.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  refine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install validation tools
+        run: |
+          python3 -m pip install lxml
+          npm install --prefix "$RUNNER_TEMP/momo-qa" playwright
+      - name: Apply report changes and check data integrity
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from lxml import html, etree
+          import re,json,gzip,base64,subprocess
+          p=Path('index.html')
+          original=p.read_text()
+          assert subprocess.check_output(['git','hash-object','index.html'],text=True).strip()=='02e69cf58de15f0b960c905aa94b42be8c71048c','Source changed; review before applying'
+          marker=re.search(r'<script\b[^>]*type="application/octet-stream"',original)
+          assert marker
+          prefix,tail=original[:marker.start()],original[marker.start():]
+          doc=html.fromstring(prefix+'</body></html>',parser=html.HTMLParser(huge_tree=True))
+          def get(i):return doc.get_element_by_id(i)
+          def text(n):return ' '.join(' '.join(n.itertext()).split())
+          def remove(n):
+              if n is not None and n.getparent() is not None:n.getparent().remove(n)
+          def replace_content(n,fragment):
+              n.text=None
+              for child in list(n):n.remove(child)
+              for child in html.fragments_fromstring(fragment):
+                  if isinstance(child,str):n.text=(n.text or '')+child
+                  else:n.append(child)
+          def group(name,child_ids):
+              box=html.Element('div',{'id':'cn-'+name+'-panel','class':'c-section','data-c-panel':'consumer:'+name,'hidden':'hidden'})
+              anchor=get(child_ids[0]);parent=anchor.getparent();parent.insert(parent.index(anchor),box)
+              for i in child_ids:
+                  n=get(i);n.attrib.pop('data-c-panel',None);n.attrib.pop('hidden',None);box.append(n)
+              return box
+          group('audience',['cn-decision','cn-target','cn-needs'])
+          group('insights',['cn-insights','cn-quality'])
+          nav=get('consumer-subnav')
+          for child in list(nav):nav.remove(child)
+          for key,label in [('snapshot','Tổng hợp trực quan'),('audience','Khách hàng & nhu cầu'),('insights','Insight'),('journey','Hành trình'),('strategy','Chiến dịch & công cụ')]:
+              b=html.Element('button',{'data-c-view':'consumer:'+key,'aria-selected':str(key=='snapshot').lower(),'role':'tab','aria-controls':'cn-'+key+('-panel' if key in ['audience','insights']else'')})
+              b.text=label;nav.append(b)
+          nav.set('role','tablist')
+          archive=get('cn-archive')
+          sources=html.fromstring('<article class="card"><h2>Nguồn dữ liệu Consumer</h2><div class="data-shortcuts"></div></article>')
+          target=sources.xpath('.//div')[0];seen=set()
+          for a in archive.xpath('.//a[@href]'):
+              if a.get('href')not in seen:
+                  seen.add(a.get('href'));target.append(html.fromstring(html.tostring(a,encoding='unicode')))
+          get('data').append(sources);remove(archive)
+          for n in list(get('data').xpath('.//details[contains(concat(" ",@class," ")," data-method ")]')):remove(n)
+          for n in get('cn-insights').xpath('.//*[contains(concat(" ",@class," ")," bigstatement ")]'):
+              replace_content(n,'<strong>Insight khách hàng</strong><p>Người phụ trách tiền điện gia đình có thể biết rõ các thiết bị đang sử dụng nhưng vẫn khó hiểu khoản tăng. Họ cần một cách giải thích gắn với cách sinh hoạt để biết nên kiểm tra hoặc điều chỉnh ở đâu.</p>')
+          remove_fragments=[
+          'Các nhận định và hướng chiến dịch được tổng hợp từ dữ liệu C1–C1D.',
+          'Insight được tổng hợp từ dữ liệu và suy luận, không phải câu nói nguyên văn',
+          'Consumer insight được tổng hợp và suy luận từ dữ liệu',
+          'Đây là cách diễn đạt nhu cầu rút ra từ hành vi',
+          'Những rào cản dưới đây được suy ra từ yêu cầu của tác vụ',
+          'Nhận định trong báo cáo được xây dựng từ ba nhóm thông tin',
+          'Các nhận định dưới đây tổng hợp sản phẩm, thông điệp truyền thông',
+          'Dữ liệu Google Trends được cung cấp dưới dạng CSV trong đợt nghiên cứu',
+          'Các trạng thái truy cập trong dữ liệu gốc là',
+          'Ma trận trên là tổng hợp định tính từ bộ 3C và Company',
+          ]
+          for pid in ['overview','category','competitor','consumer','company','strategy']:
+              for n in list(get(pid).xpath('.//p|.//small')):
+                  if any(fragment in text(n)for fragment in remove_fragments):remove(n)
+          pairs={
+          'Dùng dữ liệu để hiểu người dùng.':'Những tình huống cần hỗ trợ.',
+          'Dùng suy luận để chọn hướng hành động.':'Hàm ý cho truyền thông và sản phẩm.',
+          'Đủ dữ liệu để đi tiếp.':'Ưu tiên thiết kế công cụ mẫu.',
+          'Đủ cho phân tích Company.':'Ưu tiên kết hợp lịch sử hóa đơn, nhắc hạn và AI để thiết kế bản mẫu.',
+          'Đủ để chọn hướng; ghi rõ là suy luận.':'Thử xem người dùng hiểu kết quả dễ hơn so với các công cụ đang có.',
+          'Đủ cơ sở để lựa chọn hướng chiến lược.':'Ưu tiên triển khai hướng “Hiểu tiền điện nhà bạn”.',
+          'Cần xác nhận dữ liệu và thử công cụ trước khi triển khai.':'Làm rõ dữ liệu, thiết kế bản mẫu và đo mức hữu ích.',
+          'Đủ để chọn hướng;':'Ưu tiên hướng đề xuất;',
+          'Nhận định Company · Suy luận chiến lược':'Định hướng cho Billpay',
+          'Insight chiến lược · Suy luận từ 4C':'Cơ hội chiến lược cho Billpay',
+          'Insight suy ra':'Nhu cầu trọng tâm',
+          'Mâu thuẫn suy ra':'Điều khiến người dùng băn khoăn',
+          'Mong muốn suy ra':'Kết quả người dùng mong muốn',
+          'Rào cản suy ra':'Rào cản cần xử lý',
+          'Kết quả mong muốn được suy ra từ nhu cầu':'Kết quả người dùng mong muốn',
+          'Suy luận từ dữ liệu':'Ý nghĩa với người dùng',
+          '04 / Dữ liệu → suy luận → insight':'04 / Insight khách hàng',
+          '07 / Cơ sở lập luận và nguồn':'07 / Hàm ý cho marketing',
+          'Phạm vi diễn giải và phản chứng':'Khách hàng ưu tiên và dịch vụ đang sử dụng',
+          'Ma trận là tổng hợp chức năng, không phải điểm chất lượng hay thị phần.':'Bảng đối chiếu chức năng; không thể hiện thị phần.',
+          'Suy luận chiến lược từ 4C. Hiệu quả nhận biết, mức sử dụng và tăng trưởng cần được đo trong thử nghiệm.':'Ưu tiên đo nhận biết Billpay, mức hữu ích của công cụ và tỷ lệ quay lại sử dụng.',
+          'Thị trường mục tiêu:':'Nhóm người dùng ưu tiên:',
+          'Nhóm 30–50 miền Bắc là phạm vi chiến lược của đề bài.':'Chiến dịch ưu tiên nhóm 30–50 tuổi tại miền Bắc.',
+          'Có cơ sở suy luận nhu cầu chủ động quản lý khoản chi.':'Những trường hợp này gợi ý cơ hội hỗ trợ quản lý tiền điện.',
+          'Có thể suy luận nhu cầu này':'Trong một số tình huống, nhu cầu này',
+          'có thể suy ra bốn lợi ích người dùng tìm kiếm':'bốn lợi ích được ưu tiên cho hướng đề xuất là',
+          'Dữ liệu hiện có đủ để thiết kế trải nghiệm mẫu và kiểm tra phản ứng người dùng.':'Ưu tiên thiết kế trải nghiệm mẫu và kiểm tra mức hữu ích với nhóm người dùng mục tiêu.',
+          'Các nguồn lực đã ghi nhận phù hợp với nhu cầu và khoảng trống cạnh tranh. Có cơ sở để cụ thể hóa ý tưởng, thiết kế công cụ mẫu, rồi kiểm tra chất lượng trải nghiệm thực tế.':'Kết hợp lịch sử hóa đơn, nhắc hạn và AI để thiết kế công cụ giải thích. Bản mẫu cần giúp người dùng hiểu điều gì có thể làm tiền điện thay đổi và chọn được việc nên kiểm tra hoặc điều chỉnh.',
+          'Dữ liệu hiện có đủ để lựa chọn hướng chiến lược và thiết kế trải nghiệm mẫu.':'Ưu tiên thiết kế công cụ giải thích tiền điện và thử mức hữu ích với người phụ trách hóa đơn gia đình.',
+          'Dữ liệu 4C hiện có đủ để chọn hướng “Hiểu tiền điện nhà bạn” và thiết kế trải nghiệm mẫu.':'Ưu tiên hướng “Hiểu tiền điện nhà bạn”: giúp người dùng hiểu khoản tăng, thử cách điều chỉnh và tiếp tục quản lý hóa đơn trên Billpay.',
+          'Các nguồn hiện có đủ để lựa chọn hướng đi. Bước tiếp theo là làm rõ các bước sử dụng, dữ liệu có thể tiếp cận và phản ứng người dùng; chỉ mở lại thu thập khi có mâu thuẫn cụ thể có thể thay đổi quyết định.':'Chốt dữ liệu có thể sử dụng, thiết kế các bước nhập và trả kết quả, rồi thử với người phụ trách tiền điện gia đình. Đánh giá họ có hiểu kết quả, thấy hữu ích và muốn quay lại ở kỳ sau hay không.',
+          'Bức tranh cạnh tranh hiện có đủ để xác lập hướng phát triển này. Bước tiếp theo có giá trị là kiểm chứng trải nghiệm và khả năng tiếp cận dữ liệu, thay vì mở thêm một vòng thu thập nguồn đại trà.':'Ưu tiên thử công cụ mẫu cạnh các giải pháp đang có: cùng một cặp hóa đơn, người dùng có hiểu kết quả dễ hơn và cần ít công nhập thông tin hơn hay không.',
+          }
+          for pid in ['overview','category','competitor','consumer','company','strategy']:
+              for n in get(pid).iter():
+                  for field in ['text','tail']:
+                      value=getattr(n,field)
+                      if value:
+                          for a,b in pairs.items():value=value.replace(a,b)
+                          setattr(n,field,value)
+          for summary in list(get('category').xpath('.//summary')):
+              if text(summary)in ['Lưu ý về phạm vi số liệu và cách đọc kết quả','Xem cơ sở để tiếp tục phát triển và kiểm tra hướng truyền thông']:remove(summary.getparent())
+          for n in list(get('cn-quality').xpath('.//details')):remove(n)
+          get('cn-quality').append(html.fromstring('<article class="callout"><b>MoMo cần làm rõ lợi ích hơn so với kênh đang có.</b><p>Điện lực đã có tư vấn, theo dõi tiêu thụ và công cụ ước tính. Hướng đề xuất cho MoMo là hỏi đơn giản hơn, giải thích sát với gia đình và cho thử cách điều chỉnh ngay trong nơi xem và trả hóa đơn.</p><button data-ids="CONSUMER::CON-C1-E1034;CONSUMER::CON-C1-E0860;CONSUMER::CON-C1-E0950">Đối chiếu các trường hợp và nguồn ↗</button></article>'))
+          for b in get('company-subnav').xpath('.//button[@data-c-view="company:decision"]'):b.text='Ưu tiên triển khai'
+          for n in list(doc.xpath('//details')):
+              summary=n.find('summary')
+              if summary is not None and text(summary)=='Phạm vi mẫu và cách phân loại':remove(n)
+          css=html.Element('style',{'id':'report-navigation-refinement'})
+          css.text='''
+          .fourc-subnav{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));overflow:visible;gap:7px;align-items:stretch}
+          .fourc-subnav button{width:100%;min-width:0;max-width:100%;margin:0;white-space:normal;display:flex;align-items:center;justify-content:center;line-height:1.4;padding:11px 9px;overflow-wrap:normal}
+          #company-subnav{grid-template-columns:repeat(4,minmax(0,1fr))}
+          @media(max-width:1000px){.fourc-subnav{grid-template-columns:repeat(3,minmax(0,1fr))}#company-subnav{grid-template-columns:repeat(3,minmax(0,1fr))}}
+          @media(max-width:600px){.fourc-subnav,#company-subnav{grid-template-columns:repeat(2,minmax(0,1fr))}.fourc-subnav button{font-size:11px;padding:10px 8px}}
+          '''
+          doc.find('head').append(css)
+          matches=list(re.finditer(r'<script>([\s\S]*?)</script>',tail))
+          assert matches
+          m=matches[-1];js=m.group(1)
+          old="function cView(value,scroll=true){const [type,name]=value.split(':');"
+          assert old in js
+          new="function cView(value,scroll=true){if(value.startsWith('consumer:')){const aliases={decision:'audience',target:'audience',needs:'audience',quality:'insights',archive:'strategy'};const k=value.split(':')[1];value='consumer:'+(aliases[k]||k)}const [type,name]=value.split(':');"
+          js=js.replace(old,new,1)
+          js,n=re.subn(r"\$\('rv-prior-summary'\)\.textContent=\x60[\s\S]*?\x60;\s*const missed=RV\.models\.filter\(m=>m\.prior&&m\.scope==='other'\)\.length;\s*\$\('rv-method'\)\.innerHTML=\x60[\s\S]*?\x60;",'',js,count=1)
+          assert n==1,'Review method renderer changed'
+          for a,b in pairs.items():js=js.replace(a,b)
+          js=js.replace('Các nhận định được đối chiếu từ nhiều loại tư liệu.','Nguồn thông tin về người dùng.')
+          js=js.replace('Ba nhóm thông tin dưới đây cùng hỗ trợ hướng “hiểu để chủ động”: có người băn khoăn vì biến động, bỏ công tìm căn cứ và dùng thông tin để điều chỉnh. Đây là cơ sở lựa chọn tình huống tiếp cận; chưa phải tỷ lệ nhu cầu của toàn bộ nhóm 30–50 miền Bắc.','Có người thắc mắc khi tiền điện tăng, chủ động yêu cầu kiểm tra và theo dõi mức dùng để điều chỉnh. MoMo nên tiếp cận khi người dùng vừa gặp khoản tăng khó giải thích và giúp họ chọn việc cần làm.')
+          js=js.replace('Phân loại theo báo cáo Consumer gốc. Tỷ trọng là số bản ghi trong bộ dữ liệu, không phải tỷ trọng người dùng có nhu cầu. Nhấn thanh để xem các bản ghi và nguồn.','Tỷ trọng bản ghi theo loại nguồn, không phải tỷ lệ nhu cầu. Nhấn thanh để xem thông tin và nguồn liên quan.')
+          js=js.replace('Một bản ghi có thể gắn nhiều nhóm câu hỏi; các tỷ trọng không cộng thành 100%. Hai bản ghi không nêu mã nhóm. Biểu đồ mô tả phạm vi dữ liệu, không đo mức quan trọng của nhu cầu.','Số bản ghi theo chủ đề; một bản ghi có thể thuộc nhiều chủ đề. Nhấn thanh để xem dữ liệu liên quan.')
+          js=js.replace('Trạng thái được tổng hợp từ báo cáo Company. Chức năng hiện có có phạm vi riêng; dữ liệu kWh, kỳ ghi và quyền sử dụng cần xác nhận. Ma trận không chấm điểm năng lực và không coi phần đề xuất là tính năng đang vận hành.','Phân biệt chức năng hiện có với phần đề xuất phát triển. Xác nhận dữ liệu kWh, kỳ ghi chỉ số và quyền sử dụng trước khi triển khai công cụ giải thích.')
+          tail=tail[:m.start(1)]+js+tail[m.end(1):]
+          serial=html.tostring(doc,encoding='unicode')
+          result='<!doctype html>'+serial.rsplit('</body>',1)[0]+tail
+          inert=lambda s:re.findall(r'<script\b[^>]*type="(?:application/octet-stream|application/json)"[^>]*>[\s\S]*?</script>',s)
+          assert inert(original)==inert(result),'Embedded data changed'
+          outdoc=html.fromstring(result,parser=html.HTMLParser(huge_tree=True))
+          ids=outdoc.xpath('//@id')
+          assert len(ids)==len(set(ids)),'Duplicate element IDs'
+          for a in outdoc.xpath('//a[starts-with(@href,"#")]'):
+              assert a.get('href')=='#'or a.get('href')[1:]in ids,a.get('href')
+          core=json.loads(gzip.decompress(base64.b64decode(outdoc.get_element_by_id('embedded-0').text)))
+          byid={r['id']for r in core}
+          assert len(core)==4281
+          for n in outdoc.xpath('//*[@data-ids]'):
+              assert all(x.strip()in byid for x in n.get('data-ids').split(';')if x.strip()),n.get('data-ids')
+          assert len(outdoc.get_element_by_id('consumer-subnav').xpath('./button'))==5
+          for pid in ['overview','category','competitor','consumer','company','strategy']:
+              s=' '.join(outdoc.get_element_by_id(pid).itertext())
+              for phrase in ['Đủ dữ liệu để đi tiếp','Đủ cho phân tích Company','Dùng dữ liệu để hiểu người dùng','không phải câu nói nguyên văn','ghi rõ là suy luận','Muse','Market Research S2']:
+                  assert phrase not in s,(pid,phrase)
+          assert not outdoc.xpath('//*[@id="data"]//details[contains(concat(" ",@class," ")," data-method ")]')
+          p.write_text(result)
+          Path('/tmp/momo-report-app.js').write_text(js)
+          print(json.dumps({'staticQA':'PASS','coreRecords':len(core),'embeddedPayloads':len(inert(result)),'consumerGroups':5,'allSources':'preserved','methodologyCards':0,'bytes':p.stat().st_size}))
+          
+          PY
+          node --check /tmp/momo-report-app.js
+      - name: Check report in Chrome
+        run: |
+          cat > /tmp/momo-browser-qa.cjs <<'JS'
+          const assert=require('node:assert/strict');
+          const fs=require('node:fs');
+          const path=require('node:path');
+          const {chromium}=require(process.env.RUNNER_TEMP+'/momo-qa/node_modules/playwright');
+          (async()=>{
+          const chrome=['/usr/bin/google-chrome','/usr/bin/google-chrome-stable','/usr/bin/chromium','/usr/bin/chromium-browser'].find(p=>fs.existsSync(p));
+          assert(chrome,'Chrome executable is unavailable');
+          const browser=await chromium.launch({headless:true,executablePath:chrome,args:['--no-sandbox','--allow-file-access-from-files']});
+          const page=await browser.newPage({viewport:{width:1440,height:1050}});
+          const errors=[];page.on('pageerror',e=>errors.push(e.message));
+          await page.goto('file://'+path.resolve('index.html'),{waitUntil:'load'});
+          await page.waitForFunction(()=>document.documentElement.dataset.ready==='true'||document.documentElement.dataset.error,{timeout:60000});
+          assert.equal(await page.evaluate(()=>document.documentElement.dataset.error),undefined);
+          assert.equal(await page.evaluate(()=>core.length),4281);
+          assert.equal(await page.evaluate(()=>S.sources.length),1585);
+          await page.evaluate(()=>showTab('consumer'));
+          for(const width of [1440,1024,768,390]){
+           await page.setViewportSize({width,height:1000});
+           const layout=await page.evaluate(()=>{
+             const n=document.getElementById('consumer-subnav'),r=n.getBoundingClientRect();
+             return {client:n.clientWidth,scroll:n.scrollWidth,display:getComputedStyle(n).display,
+               buttons:[...n.querySelectorAll('button')].map(b=>{const q=b.getBoundingClientRect();return {left:q.left-r.left,right:q.right-r.left,width:q.width,visible:q.width>0&&q.height>0}})};
+           });
+           assert.equal(layout.display,'grid');assert(layout.scroll<=layout.client+1,'Consumer horizontal overflow at '+width);
+           assert.equal(layout.buttons.length,5);
+           assert(layout.buttons.every(b=>b.visible&&b.left>=-1&&b.right<=layout.client+2),'Consumer buttons clipped at '+width);
+          }
+          await page.setViewportSize({width:1440,height:1050});
+          await page.locator('#consumer-subnav [data-c-view="consumer:audience"]').click();
+          assert(await page.locator('#cn-target').isVisible());
+          assert(await page.locator('#cn-needs').isVisible());
+          assert(!(await page.locator('#cn-journey').isVisible()));
+          await page.locator('#consumer-subnav [data-c-view="consumer:insights"]').click();
+          assert(await page.locator('#cn-insights').isVisible());
+          assert(await page.locator('#cn-quality').isVisible());
+          await page.locator('#consumer-subnav [data-c-view="consumer:journey"]').click();
+          assert(await page.locator('#cn-journey').isVisible());
+          assert(!(await page.locator('#cn-insights').isVisible()));
+          const offset=await page.evaluate(()=>document.getElementById('cn-journey').getBoundingClientRect().top-document.getElementById('consumer-subnav').getBoundingClientRect().bottom);
+          assert(offset>=-1&&offset<45,'Selected Consumer section scroll position: '+offset);
+          await page.evaluate(()=>cView('consumer:needs'));
+          assert(await page.locator('#cn-needs').isVisible(),'Legacy Consumer link no longer works');
+          await page.locator('#consumer-subnav [data-c-view="consumer:strategy"]').click();
+          assert(await page.locator('#cn-strategy').isVisible());
+          await page.evaluate(()=>{showTab('competitor');compView('feedback')});
+          assert(!(await page.locator('#co-campaigns').isVisible()));
+          await page.evaluate(()=>compView('campaigns'));
+          assert(await page.locator('#co-campaigns').isVisible());
+          await page.evaluate(()=>{showTab('data')});
+          for(const [id,count]of [['core',4281],['sourcesall',1585],['Consumer:evidence',1353],['Company:data',619],['reviews',52923]]){
+           await page.evaluate(id=>selectDataset(id),id);
+           assert.equal(await page.evaluate(()=>currentRows.length),count,id);
+          }
+          await page.evaluate(()=>{showTab('reviews')});
+          await page.evaluate(()=>ensureReviewAnalytics());
+          assert.equal(await page.evaluate(()=>RV.models.length),52923);
+          assert.equal(await page.evaluate(()=>RV.pool.length),52392);
+          assert.equal(await page.locator('#rv-stars .rv-chart-bar').count(),5);
+          assert.equal(await page.locator('#rv-method').count(),0);
+          await page.evaluate(()=>evidence('CONSUMER::CON-C1-E1088'));
+          assert((await page.locator('#detail-body a[href^="http"]').count())>0);
+          await page.locator('#close-detail').click();
+          for(const id of ['overview','category','competitor','consumer','company','strategy']){
+           const prose=await page.evaluate(id=>document.getElementById(id).textContent,id);
+           for(const phrase of ['Đủ dữ liệu để đi tiếp','Đủ cho phân tích Company','Dùng dữ liệu để hiểu người dùng','không phải câu nói nguyên văn','ghi rõ là suy luận','Muse','Market Research S2']){
+             assert(!prose.includes(phrase),id+': '+phrase);
+           }
+          }
+          assert.deepEqual(errors,[]);
+          console.log(JSON.stringify({browserQA:'PASS',viewports:[1440,1024,768,390],consumerTabs:5,horizontalOverflow:false,legacyLinks:'PASS',scroll:'PASS',competitorCampaignIsolation:'PASS',core:4281,sourceProfiles:1585,consumer:1353,company:619,reviews:52923,defaultReviewPeriod:52392,sourceModal:'PASS',pageErrors:errors}));
+          await browser.close();
+          })().catch(e=>{console.error(e);process.exit(1)});
+          
+          JS
+          node /tmp/momo-browser-qa.cjs
+      - name: Commit validated report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git commit -m "Improve Consumer navigation and write report for marketing decisions"
+          git push origin HEAD:main
